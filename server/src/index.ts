@@ -9,6 +9,7 @@ import userRoutes from './routes/users';
 import catalogRoutes from './routes/catalog';
 import customerRoutes from './routes/customers';
 import templateRoutes from './routes/templates';
+import subscriptionRoutes from './routes/subscriptions';
 
 const app = express();
 
@@ -49,6 +50,7 @@ app.use('/api/users', userRoutes);
 app.use('/api/catalog', catalogRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/templates', templateRoutes);
+app.use('/api/subscriptions', subscriptionRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
 app.use(errorHandler);
