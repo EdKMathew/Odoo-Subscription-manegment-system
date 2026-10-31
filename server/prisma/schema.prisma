@@ -101,6 +101,7 @@ model Customer {
   user          User?
   subscriptions Subscription[]
   invoices      Invoice[]
+  creditNotes   CreditNote[]
 
   @@index([email])
   @@index([name])
@@ -191,6 +192,7 @@ model Plan {
 
   subscriptions Subscription[]
   templates     QuoteTemplate[]
+  pendingFor    Subscription[] @relation("PendingPlan")
 }
 
 model QuoteTemplate {
@@ -234,14 +236,23 @@ model Subscription {
   pausedAt        DateTime?
   closedAt        DateTime?
   closeReason     String?
+  // Set when the subscription was paused automatically for non-payment.
+  suspendedAt     DateTime?
+  // Downgrades wait for the next billing date before switching plan.
+  pendingPlanId   Int?
+  pendingPlan     Plan?              @relation("PendingPlan", fields: [pendingPlanId], references: [id])
+  renewalOfId     Int?               @unique
+  renewalOf       Subscription?      @relation("Renewal", fields: [renewalOfId], references: [id])
+  renewal         Subscription?      @relation("Renewal")
   notes           String?
   createdById     Int?
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
 
-  lines    SubscriptionLine[]
-  invoices Invoice[]
-  events   SubscriptionEvent[]
+  lines       SubscriptionLine[]
+  invoices    Invoice[]
+  events      SubscriptionEvent[]
+  creditNotes CreditNote[]
 
   @@index([status, nextBillingDate])
   @@index([customerId])
@@ -273,9 +284,42 @@ model SubscriptionEvent {
   message        String
   actorId        Int?
   actorName      String?
+  // Change in monthly recurring revenue caused by this event, for MRR movement.
+  mrrKind        String?
+  mrrDelta       Int?
   createdAt      DateTime     @default(now())
 
   @@index([subscriptionId, createdAt])
+  @@index([mrrKind, createdAt])
+}
+
+enum CreditNoteStatus {
+  OPEN
+  APPLIED
+  VOID
+}
+
+// Credit owed to a customer. Confirmed invoices are never edited; corrections and
+// unused time on upgrades become credit notes that reduce the next invoice.
+model CreditNote {
+  id                Int              @id @default(autoincrement())
+  number            String           @unique
+  customerId        Int
+  customer          Customer         @relation(fields: [customerId], references: [id])
+  subscriptionId    Int?
+  subscription      Subscription?    @relation(fields: [subscriptionId], references: [id])
+  invoiceId         Int?
+  invoice           Invoice?         @relation("CreditFor", fields: [invoiceId], references: [id])
+  reason            String
+  total             Int
+  taxAmount         Int              @default(0)
+  remaining         Int
+  status            CreditNoteStatus @default(OPEN)
+  appliedToInvoices Invoice[]        @relation("CreditApplied")
+  createdById       Int?
+  createdAt         DateTime         @default(now())
+
+  @@index([customerId, status])
 }
 
 model Discount {
@@ -331,8 +375,10 @@ model Invoice {
   cancelledAt    DateTime?
   createdAt      DateTime      @default(now())
 
-  lines    InvoiceLine[]
-  payments Payment[]
+  lines          InvoiceLine[]
+  payments       Payment[]
+  creditNotes    CreditNote[] @relation("CreditFor")
+  creditsApplied CreditNote[] @relation("CreditApplied")
 
   @@unique([subscriptionId, periodStart])
   @@index([status, dueDate])

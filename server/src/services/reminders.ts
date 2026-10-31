@@ -1,4 +1,6 @@
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
+import { monthlyValue } from './subscriptions';
 import { addDays, startOfDay } from '../lib/dates';
 import { formatINR } from '../lib/money';
 import { config } from '../config';
@@ -46,5 +48,85 @@ export async function sendPaymentReminders(asOf = new Date()) {
     ]);
     sent += invoices.length;
   }
-  return { sent };
+  const { suspended } = await suspendForNonPayment(today);
+  return { sent, suspended };
+}
+
+// After the final reminder there is a grace period. If an invoice is still unpaid
+// SUSPEND_AFTER_DAYS past its due date, the subscription is suspended (paused), not
+// closed, so it can come straight back when the customer pays.
+export const SUSPEND_AFTER_DAYS = 14;
+
+export async function suspendForNonPayment(today = startOfDay()) {
+  const subs = await prisma.subscription.findMany({
+    where: {
+      status: 'ACTIVE',
+      invoices: { some: { status: 'CONFIRMED', dueDate: { lt: addDays(today, -SUSPEND_AFTER_DAYS) } } },
+    },
+    include: { plan: true, lines: true, customer: { select: { name: true, email: true } } },
+    take: 5000,
+  });
+  if (!subs.length) return { suspended: 0 };
+  const now = new Date();
+  await prisma.$transaction([
+    prisma.subscription.updateMany({
+      where: { id: { in: subs.map((s) => s.id) }, status: 'ACTIVE' },
+      data: { status: 'PAUSED', pausedAt: now, suspendedAt: now },
+    }),
+    prisma.subscriptionEvent.createMany({
+      data: subs.map((s) => ({
+        subscriptionId: s.id,
+        type: 'STATUS',
+        fromStatus: 'ACTIVE',
+        toStatus: 'PAUSED',
+        message: `Suspended: invoice unpaid more than ${SUSPEND_AFTER_DAYS} days after the due date`,
+        actorName: 'System',
+        mrrKind: 'CHURN_INVOLUNTARY',
+        mrrDelta: -monthlyValue(s.plan, s.lines),
+      })),
+    }),
+    prisma.outboxEmail.createMany({
+      data: subs.map((s) => ({
+        to: s.customer.email,
+        kind: 'SUSPENSION',
+        subject: `Service suspended: ${s.number}`,
+        body: `Hi ${s.customer.name},\n\nYour subscription ${s.number} (${s.plan.name}) has been suspended because an invoice is more than ${SUSPEND_AFTER_DAYS} days overdue.\n\nIt has not been cancelled. As soon as the overdue invoice is paid it will resume automatically, with your current pricing.\n\nView your invoices: ${config.clientUrl}/portal/invoices?status=OVERDUE`,
+      })),
+    }),
+  ]);
+  return { suspended: subs.length };
+}
+
+// Called after a payment: if nothing is badly overdue any more, a suspended
+// subscription is restored and counted as recovered revenue.
+export async function resumeIfRecovered(tx: Prisma.TransactionClient, subscriptionId: number) {
+  const sub = await tx.subscription.findUnique({ where: { id: subscriptionId }, include: { plan: true, lines: true } });
+  if (!sub || sub.status !== 'PAUSED' || !sub.suspendedAt) return false;
+  const today = startOfDay();
+  const stillOverdue = await tx.invoice.count({
+    where: { subscriptionId, status: 'CONFIRMED', dueDate: { lt: addDays(today, -SUSPEND_AFTER_DAYS) } },
+  });
+  if (stillOverdue) return false;
+  await tx.subscription.update({
+    where: { id: subscriptionId },
+    data: {
+      status: 'ACTIVE',
+      pausedAt: null,
+      suspendedAt: null,
+      ...(!sub.nextBillingDate || sub.nextBillingDate < today ? { nextBillingDate: today } : {}),
+    },
+  });
+  await tx.subscriptionEvent.create({
+    data: {
+      subscriptionId,
+      type: 'STATUS',
+      fromStatus: 'PAUSED',
+      toStatus: 'ACTIVE',
+      message: 'Resumed automatically after the overdue invoice was paid',
+      actorName: 'System',
+      mrrKind: 'REACTIVATION',
+      mrrDelta: monthlyValue(sub.plan, sub.lines),
+    },
+  });
+  return true;
 }
