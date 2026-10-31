@@ -11,6 +11,9 @@ import { queueEmail } from '../lib/outbox';
 import { config } from '../config';
 import { logEvent } from '../services/subscriptions';
 import { invoicePdfInclude, renderInvoicePdf } from '../services/pdf';
+import { toEinvoiceJson } from '../services/einvoice';
+import { issueCreditNote } from '../services/credits';
+import { resumeIfRecovered } from '../services/reminders';
 
 const router = Router();
 router.use(requireAuth);
@@ -94,6 +97,46 @@ router.get(
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${inv.number}.pdf"`);
     renderInvoicePdf(inv).pipe(res);
+  }),
+);
+
+// Confirms draft invoices in bulk after a billing run has been reviewed.
+router.post(
+  '/confirm-drafts',
+  staffOnly,
+  asyncHandler(async (req, res) => {
+    const { billingRunId } = z.object({ billingRunId: z.number().int().positive().optional() }).parse(req.body);
+    const where = { status: 'DRAFT' as const, ...(billingRunId ? { billingRunId } : {}) };
+    const drafts = await prisma.invoice.findMany({ where, select: { id: true, number: true, subscriptionId: true }, take: 5000 });
+    if (!drafts.length) return res.json({ confirmed: 0 });
+    await prisma.$transaction(async (tx) => {
+      await tx.invoice.updateMany({ where: { id: { in: drafts.map((d) => d.id) }, status: 'DRAFT' }, data: { status: 'CONFIRMED', confirmedAt: new Date() } });
+      await tx.subscriptionEvent.createMany({
+        data: drafts
+          .filter((d) => d.subscriptionId)
+          .map((d) => ({
+            subscriptionId: d.subscriptionId!,
+            type: 'INVOICE',
+            message: `Invoice ${d.number} confirmed`,
+            actorId: req.user!.id,
+            actorName: `${req.user!.name} (${req.user!.role.toLowerCase()})`,
+          })),
+      });
+    });
+    res.json({ confirmed: drafts.length });
+  }),
+);
+
+// E-invoice (IRN) ready JSON for B2B invoices. Not sent anywhere; downloaded for upload.
+router.get(
+  '/:id/einvoice',
+  staffOnly,
+  asyncHandler(async (req, res) => {
+    const inv = await prisma.invoice.findUnique({ where: { id: idParam(req) }, include: { customer: true, lines: { orderBy: { id: 'asc' } } } });
+    if (!inv) throw notFound('Invoice not found');
+    if (inv.status === 'DRAFT' || inv.status === 'CANCELLED') throw conflict('Only confirmed or paid invoices can be exported');
+    res.setHeader('Content-Disposition', `attachment; filename="${inv.number}-einvoice.json"`);
+    res.json(toEinvoiceJson(inv));
   }),
 );
 
@@ -182,6 +225,7 @@ export async function recordPayment(invoiceId: number, input: z.infer<typeof pay
         { type: 'PAYMENT', message: `Payment of ${formatINR(input.amount)} by ${input.method.replace('_', ' ').toLowerCase()} on ${inv.number}${paid ? ' (fully paid)' : ''}` },
         actor,
       );
+      if (paid) await resumeIfRecovered(tx, inv.subscriptionId);
     }
     await queueEmail(
       {
@@ -202,6 +246,47 @@ router.post(
   asyncHandler(async (req, res) => {
     const payment = await recordPayment(idParam(req), paymentSchema.parse(req.body), req.user!);
     res.status(201).json(payment);
+  }),
+);
+
+const creditSchema = z.object({
+  amount: z.coerce.number().positive().max(100_000_000).transform((r) => Math.round(r * 100)),
+  reason: z.string().trim().min(3, 'Give a reason').max(300),
+});
+
+// Corrects a confirmed or paid invoice without editing it: the credit note is
+// deducted from the customer's next invoice automatically.
+router.post(
+  '/:id/credit-note',
+  staffOnly,
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const { amount, reason } = creditSchema.parse(req.body);
+    const note = await prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<{ id: number }[]>`SELECT "id" FROM "Invoice" WHERE "id" = ${id} FOR UPDATE`;
+      if (!rows.length) throw notFound('Invoice not found');
+      const inv = await tx.invoice.findUniqueOrThrow({ where: { id }, include: { creditNotes: { where: { status: { not: 'VOID' } } } } });
+      if (inv.status !== 'CONFIRMED' && inv.status !== 'PAID') throw conflict('Credit notes can only be issued for confirmed or paid invoices');
+      const credited = inv.creditNotes.reduce((s, c) => s + c.total, 0);
+      if (amount > inv.total - credited) throw badRequest(`Maximum credit for this invoice is ${formatINR(inv.total - credited)}`);
+      const created = await issueCreditNote(
+        tx,
+        {
+          customerId: inv.customerId,
+          subscriptionId: inv.subscriptionId,
+          invoiceId: inv.id,
+          reason,
+          total: amount,
+          taxAmount: inv.total > 0 ? Math.round((amount * inv.taxTotal) / inv.total) : 0,
+        },
+        req.user!,
+      );
+      if (inv.subscriptionId) {
+        await logEvent(tx, inv.subscriptionId, { type: 'CREDIT', message: `Credit note ${created.number} for ${formatINR(amount)} on ${inv.number}: ${reason}` }, req.user!);
+      }
+      return created;
+    });
+    res.status(201).json(note);
   }),
 );
 

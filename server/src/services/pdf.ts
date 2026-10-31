@@ -3,6 +3,7 @@ import type { Prisma } from '@prisma/client';
 import { config } from '../config';
 
 export const invoicePdfInclude = {
+  creditNotes: { orderBy: { createdAt: 'asc' } },
   customer: true,
   lines: { orderBy: { id: 'asc' } },
   payments: { orderBy: { paidAt: 'asc' } },
