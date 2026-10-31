@@ -5,6 +5,7 @@ import { asyncHandler } from '../lib/errors';
 import { customerScope, requireAuth, requireRole } from '../middleware/auth';
 import { startOfDay } from '../lib/dates';
 import { loadPricingContext, priceSubscription, subscriptionPricingInclude } from '../services/pricing';
+import { applyOpenCredits } from '../services/credits';
 
 const router = Router();
 router.use(requireAuth, requireRole('CUSTOMER'));
@@ -15,11 +16,11 @@ router.get(
   asyncHandler(async (req, res) => {
     const customerId = customerScope(req)!;
     const today = startOfDay();
-    const [customer, subs, open, payments] = await Promise.all([
+    const [customer, subs, open, payments, credits] = await Promise.all([
       prisma.customer.findUniqueOrThrow({ where: { id: customerId }, select: { name: true, email: true, phone: true, gstin: true, state: true, address: true } }),
       prisma.subscription.findMany({
         where: { customerId, status: { in: ['ACTIVE', 'PAUSED', 'QUOTATION', 'CONFIRMED'] } },
-        include: subscriptionPricingInclude,
+        include: { ...subscriptionPricingInclude, pendingPlan: true },
         orderBy: { id: 'desc' },
         take: 20,
       }),
@@ -34,14 +35,21 @@ router.get(
         orderBy: { paidAt: 'desc' },
         take: 10,
       }),
+      prisma.creditNote.findMany({
+        where: { customerId, status: 'OPEN' },
+        select: { id: true, number: true, reason: true, total: true, remaining: true, createdAt: true },
+        orderBy: { createdAt: 'asc' },
+      }),
     ]);
 
     const nextBills = [];
     for (const sub of subs) {
       if (sub.status !== 'ACTIVE' || !sub.nextBillingDate) continue;
       const ctx = await loadPricingContext(prisma, sub.nextBillingDate);
-      const priced = priceSubscription(sub, ctx);
-      nextBills.push({ subscriptionId: sub.id, number: sub.number, plan: sub.plan.name, date: sub.nextBillingDate, ...priced });
+      // Reflect a scheduled plan change and any open credit the customer has.
+      const plan = sub.pendingPlan ?? sub.plan;
+      const { priced } = await applyOpenCredits(prisma, customerId, priceSubscription({ ...sub, plan }, ctx));
+      nextBills.push({ subscriptionId: sub.id, number: sub.number, plan: plan.name, date: sub.nextBillingDate, ...priced });
     }
 
     res.json({
@@ -51,6 +59,8 @@ router.get(
         number: s.number,
         status: s.status,
         plan: { name: s.plan.name, billingPeriod: s.plan.billingPeriod, pausable: s.plan.pausable, closable: s.plan.closable },
+        pendingPlan: s.pendingPlan ? { name: s.pendingPlan.name } : null,
+        suspended: !!s.suspendedAt,
         nextBillingDate: s.nextBillingDate,
         expiryDate: s.expiryDate,
       })),
@@ -59,6 +69,8 @@ router.get(
       openInvoices: open.length,
       recentPayments: payments,
       nextBills,
+      credits,
+      creditBalance: credits.reduce((s, c) => s + c.remaining, 0),
     });
   }),
 );

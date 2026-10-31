@@ -94,8 +94,10 @@ router.get(
   }),
 );
 
-// MRR movement for the selected range: new subscriptions started, churn split
-// into voluntary (closed) and involuntary (overdue past 30 days), and pauses.
+
+// MRR movement in the range, built from the MRR change recorded on each
+// subscription event: new, expansion, contraction, churn (voluntary and
+// involuntary), pauses and reactivations.
 router.get(
   '/mrr-movement',
   asyncHandler(async (req, res) => {
@@ -104,39 +106,64 @@ router.get(
     const rangeFrom = from ?? new Date(today.getFullYear(), today.getMonth(), 1);
     const rangeTo = to ? addDays(startOfDay(to), 1) : addDays(today, 1);
 
-    // Monthly value of each subscription, same formula as the MRR total.
-    const rows = await prisma.$queryRaw<{ kind: string; mrr: number | null; count: bigint }[]>`
-      WITH sub_mrr AS (
-        SELECT s."id", s."status", s."startDate", s."closedAt", s."pausedAt",
+    const rows = await prisma.$queryRaw<{ kind: string; delta: bigint | null; count: bigint }[]>`
+      SELECT "mrrKind" AS kind, SUM("mrrDelta") AS delta, COUNT(*) AS count
+      FROM "SubscriptionEvent"
+      WHERE "mrrKind" IS NOT NULL AND "createdAt" >= ${rangeFrom} AND "createdAt" < ${rangeTo}
+      GROUP BY "mrrKind"`;
+    const kinds = ['NEW', 'EXPANSION', 'CONTRACTION', 'CHURN', 'CHURN_INVOLUNTARY', 'PAUSE', 'REACTIVATION'] as const;
+    const movement = Object.fromEntries(
+      kinds.map((k) => {
+        const r = rows.find((x) => x.kind === k);
+        return [k, { mrr: n(r?.delta), count: n(r?.count) }];
+      }),
+    ) as Record<(typeof kinds)[number], { mrr: number; count: number }>;
+    const net = kinds.reduce((s, k) => s + movement[k].mrr, 0);
+    res.json({ movement, net });
+  }),
+);
+
+// Dunning results: how much overdue money is at risk, and how much of what went
+// overdue was recovered after reminders.
+router.get(
+  '/collections',
+  asyncHandler(async (_req, res) => {
+    const today = startOfDay();
+    const [recovery, atRisk, suspended] = await Promise.all([
+      // Invoices that reached the overdue reminder: paid since (recovered) vs still open.
+      prisma.$queryRaw<{ status: string; count: bigint; amount: bigint | null }[]>`
+        SELECT "status", COUNT(*) AS count, SUM("total") AS amount
+        FROM "Invoice" WHERE "reminderStage" >= 3 AND "status" IN ('PAID', 'CONFIRMED')
+        GROUP BY "status"`,
+      // Monthly revenue of active subscriptions that have an overdue invoice.
+      prisma.$queryRaw<{ mrr: number | null; count: bigint }[]>`
+        SELECT SUM(
           (p."price" + COALESCE(l.line_total, 0)) *
-          CASE p."billingPeriod" WHEN 'DAILY' THEN 30 WHEN 'WEEKLY' THEN 52.0 / 12 WHEN 'MONTHLY' THEN 1 ELSE 1.0 / 12 END AS mrr
+          CASE p."billingPeriod" WHEN 'DAILY' THEN 30 WHEN 'WEEKLY' THEN 52.0 / 12 WHEN 'MONTHLY' THEN 1 ELSE 1.0 / 12 END
+        )::float AS mrr, COUNT(*) AS count
         FROM "Subscription" s
         JOIN "Plan" p ON p."id" = s."planId"
         LEFT JOIN (SELECT "subscriptionId", SUM("quantity" * "unitPrice") AS line_total FROM "SubscriptionLine" GROUP BY 1) l
           ON l."subscriptionId" = s."id"
-      )
-      SELECT 'new' AS kind, SUM(mrr)::float AS mrr, COUNT(*) AS count FROM sub_mrr
-        WHERE "startDate" >= ${rangeFrom} AND "startDate" < ${rangeTo} AND "status" IN ('ACTIVE', 'PAUSED', 'CLOSED')
-      UNION ALL
-      SELECT 'voluntary_churn', SUM(mrr)::float, COUNT(*) FROM sub_mrr
-        WHERE "status" = 'CLOSED' AND "closedAt" >= ${rangeFrom} AND "closedAt" < ${rangeTo}
-      UNION ALL
-      SELECT 'paused', SUM(mrr)::float, COUNT(*) FROM sub_mrr WHERE "status" = 'PAUSED'
-      UNION ALL
-      SELECT 'involuntary_risk', SUM(mrr)::float, COUNT(*) FROM sub_mrr
-        WHERE "status" = 'ACTIVE' AND "id" IN (
-          SELECT DISTINCT "subscriptionId" FROM "Invoice"
-          WHERE "status" = 'CONFIRMED' AND "dueDate" < ${addDays(today, -30)} AND "subscriptionId" IS NOT NULL
-        )`;
-    const get = (k: string) => {
-      const r = rows.find((x) => x.kind === k);
-      return { mrr: Math.round(n(r?.mrr)), count: n(r?.count) };
-    };
+        WHERE s."status" = 'ACTIVE' AND EXISTS (
+          SELECT 1 FROM "Invoice" i WHERE i."subscriptionId" = s."id" AND i."status" = 'CONFIRMED' AND i."dueDate" < ${today}
+        )`,
+      prisma.subscription.count({ where: { status: 'PAUSED', suspendedAt: { not: null } } }),
+    ]);
+    const paid = recovery.find((r) => r.status === 'PAID');
+    const open = recovery.find((r) => r.status === 'CONFIRMED');
+    const recoveredCount = n(paid?.count);
+    const openCount = n(open?.count);
     res.json({
-      new: get('new'),
-      voluntaryChurn: get('voluntary_churn'),
-      paused: get('paused'),
-      involuntaryRisk: get('involuntary_risk'),
+      revenueAtRisk: { mrr: Math.round(n(atRisk[0]?.mrr)), subscriptions: n(atRisk[0]?.count) },
+      recovery: {
+        rate: recoveredCount + openCount ? recoveredCount / (recoveredCount + openCount) : null,
+        recoveredCount,
+        recoveredAmount: n(paid?.amount),
+        stillOpenCount: openCount,
+        stillOpenAmount: n(open?.amount),
+      },
+      suspended,
     });
   }),
 );
@@ -203,6 +230,7 @@ router.get(
           expiryDate: true,
           customer: { select: { id: true, name: true } },
           plan: { select: { id: true, name: true, renewable: true } },
+          renewal: { select: { id: true, number: true, status: true } },
         },
       }),
       prisma.subscription.count({ where }),
