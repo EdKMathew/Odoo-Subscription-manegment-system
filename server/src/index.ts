@@ -7,6 +7,8 @@ import { errorHandler, HttpError } from './lib/errors';
 import authRoutes from './routes/auth';
 import userRoutes from './routes/users';
 import catalogRoutes from './routes/catalog';
+import customerRoutes from './routes/customers';
+import templateRoutes from './routes/templates';
 
 const app = express();
 
@@ -45,6 +47,8 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/catalog', catalogRoutes);
+app.use('/api/customers', customerRoutes);
+app.use('/api/templates', templateRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
 app.use(errorHandler);
