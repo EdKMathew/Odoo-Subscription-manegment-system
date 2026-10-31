@@ -8,7 +8,8 @@ import { requireAuth, staffOnly } from '../middleware/auth';
 import { recordPayment } from './invoices';
 
 const router = Router();
-router.use(requireAuth, staffOnly);
+// Statements can be larger than other requests, so this router parses its own bodies.
+router.use(requireAuth, staffOnly, express.json({ limit: '1mb' }));
 
 interface StatementRow {
   row: number;
@@ -50,7 +51,6 @@ const words = (s: string) => new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(
 // then exact amount + customer name, then exact amount alone, then fuzzy name match.
 router.post(
   '/preview',
-  express.json({ limit: '1mb' }),
   asyncHandler(async (req, res) => {
     const { csv } = z.object({ csv: z.string().min(1).max(900_000) }).parse(req.body);
     const rows = parseStatement(csv);
