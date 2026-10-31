@@ -9,6 +9,7 @@ import { idParam, optionalString, pageResult, paging } from '../lib/paging';
 import { createToken, hashPassword } from '../lib/password';
 import { queueEmail } from '../lib/outbox';
 import { config } from '../config';
+import { addDays, startOfDay } from '../lib/dates';
 
 const router = Router();
 router.use(requireAuth, staffOnly);
@@ -62,9 +63,27 @@ router.get(
       },
     });
     if (!customer) throw notFound('Customer not found');
-    res.json(customer);
+    res.json({ ...customer, risk: await riskReasons(customer.id) });
   }),
 );
+
+// Simple, explainable at-risk rules (no model): late payments, ignored reminders,
+// paused subscriptions and recent cancellations.
+async function riskReasons(customerId: number) {
+  const today = startOfDay();
+  const [overdue, ignored, paused, cancelled] = await Promise.all([
+    prisma.invoice.count({ where: { customerId, status: 'CONFIRMED', dueDate: { lt: today } } }),
+    prisma.invoice.count({ where: { customerId, status: 'CONFIRMED', reminderStage: { gte: 3 } } }),
+    prisma.subscription.count({ where: { customerId, status: 'PAUSED' } }),
+    prisma.subscription.count({ where: { customerId, status: 'CLOSED', closedAt: { gte: addDays(today, -30) } } }),
+  ]);
+  const reasons: string[] = [];
+  if (overdue) reasons.push(`${overdue} overdue invoice${overdue > 1 ? 's' : ''}`);
+  if (ignored) reasons.push(`${ignored} invoice${ignored > 1 ? 's' : ''} past the overdue reminder`);
+  if (paused) reasons.push(`${paused} paused subscription${paused > 1 ? 's' : ''}`);
+  if (cancelled) reasons.push('Cancelled a subscription in the last 30 days');
+  return reasons;
+}
 
 router.post(
   '/',
