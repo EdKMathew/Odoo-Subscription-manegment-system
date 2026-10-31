@@ -1,0 +1,401 @@
+// All money values are stored as integers in paise (1 INR = 100 paise).
+// Tax and percentage discount rates are stored in basis points (18% = 1800).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  STAFF
+  CUSTOMER
+}
+
+enum ProductType {
+  SERVICE
+  GOODS
+}
+
+enum BillingPeriod {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  DRAFT
+  QUOTATION
+  CONFIRMED
+  ACTIVE
+  PAUSED
+  CLOSED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  CONFIRMED
+  PAID
+  CANCELLED
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+enum DiscountScope {
+  SUBSCRIPTION
+  PRODUCTS
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  UPI
+  CARD
+  CHEQUE
+}
+
+model User {
+  id           Int       @id @default(autoincrement())
+  email        String    @unique
+  name         String
+  passwordHash String
+  role         Role      @default(CUSTOMER)
+  active       Boolean   @default(true)
+  customerId   Int?      @unique
+  customer     Customer? @relation(fields: [customerId], references: [id])
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  passwordResets PasswordReset[]
+}
+
+model PasswordReset {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model Customer {
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String
+  phone     String?
+  gstin     String?
+  state     String?
+  address   String?
+  createdAt DateTime @default(now())
+
+  user          User?
+  subscriptions Subscription[]
+  invoices      Invoice[]
+
+  @@index([email])
+  @@index([name])
+}
+
+model TaxRule {
+  id        Int      @id @default(autoincrement())
+  name      String
+  rateBp    Int
+  isDefault Boolean  @default(false)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  products Product[]
+}
+
+model Product {
+  id         Int         @id @default(autoincrement())
+  name       String
+  type       ProductType @default(SERVICE)
+  salesPrice Int
+  costPrice  Int         @default(0)
+  notes      String?
+  active     Boolean     @default(true)
+  taxRuleId  Int?
+  taxRule    TaxRule?    @relation(fields: [taxRuleId], references: [id])
+  createdAt  DateTime    @default(now())
+
+  variants          ProductVariant[]
+  subscriptionLines SubscriptionLine[]
+  templateLines     QuoteTemplateLine[]
+  discounts         DiscountProduct[]
+}
+
+model Attribute {
+  id     Int              @id @default(autoincrement())
+  name   String           @unique
+  values AttributeValue[]
+}
+
+model AttributeValue {
+  id          Int       @id @default(autoincrement())
+  attributeId Int
+  attribute   Attribute @relation(fields: [attributeId], references: [id], onDelete: Cascade)
+  value       String
+  priceExtra  Int       @default(0)
+
+  variants VariantValue[]
+
+  @@unique([attributeId, value])
+}
+
+model ProductVariant {
+  id        Int     @id @default(autoincrement())
+  productId Int
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name      String
+  active    Boolean @default(true)
+
+  values            VariantValue[]
+  subscriptionLines SubscriptionLine[]
+  templateLines     QuoteTemplateLine[]
+}
+
+model VariantValue {
+  variantId        Int
+  variant          ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  attributeValueId Int
+  attributeValue   AttributeValue @relation(fields: [attributeValueId], references: [id], onDelete: Cascade)
+
+  @@id([variantId, attributeValueId])
+}
+
+model Plan {
+  id            Int           @id @default(autoincrement())
+  name          String
+  price         Int
+  billingPeriod BillingPeriod
+  minQuantity   Int           @default(1)
+  availableFrom DateTime?
+  availableTo   DateTime?
+  autoClose     Boolean       @default(false)
+  closable      Boolean       @default(true)
+  pausable      Boolean       @default(false)
+  renewable     Boolean       @default(true)
+  active        Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+
+  subscriptions Subscription[]
+  templates     QuoteTemplate[]
+}
+
+model QuoteTemplate {
+  id           Int      @id @default(autoincrement())
+  name         String
+  planId       Int
+  plan         Plan     @relation(fields: [planId], references: [id])
+  validityDays Int      @default(30)
+  durationDays Int?
+  createdAt    DateTime @default(now())
+
+  lines QuoteTemplateLine[]
+}
+
+model QuoteTemplateLine {
+  id         Int             @id @default(autoincrement())
+  templateId Int
+  template   QuoteTemplate   @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  productId  Int
+  product    Product         @relation(fields: [productId], references: [id])
+  variantId  Int?
+  variant    ProductVariant? @relation(fields: [variantId], references: [id])
+  quantity   Int             @default(1)
+}
+
+model Subscription {
+  id              Int                @id @default(autoincrement())
+  number          String             @unique
+  customerId      Int
+  customer        Customer           @relation(fields: [customerId], references: [id])
+  planId          Int
+  plan            Plan               @relation(fields: [planId], references: [id])
+  status          SubscriptionStatus @default(DRAFT)
+  startDate       DateTime?
+  expiryDate      DateTime?
+  nextBillingDate DateTime?
+  paymentTermDays Int                @default(15)
+  quoteExpiresAt  DateTime?
+  acceptTokenHash String?            @unique
+  acceptedAt      DateTime?
+  pausedAt        DateTime?
+  closedAt        DateTime?
+  closeReason     String?
+  notes           String?
+  createdById     Int?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  lines    SubscriptionLine[]
+  invoices Invoice[]
+  events   SubscriptionEvent[]
+
+  @@index([status, nextBillingDate])
+  @@index([customerId])
+  @@index([status, expiryDate])
+}
+
+model SubscriptionLine {
+  id             Int             @id @default(autoincrement())
+  subscriptionId Int
+  subscription   Subscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  productId      Int
+  product        Product         @relation(fields: [productId], references: [id])
+  variantId      Int?
+  variant        ProductVariant? @relation(fields: [variantId], references: [id])
+  description    String
+  quantity       Int
+  unitPrice      Int
+
+  @@index([subscriptionId])
+}
+
+model SubscriptionEvent {
+  id             Int          @id @default(autoincrement())
+  subscriptionId Int
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  type           String
+  fromStatus     String?
+  toStatus       String?
+  message        String
+  actorId        Int?
+  actorName      String?
+  createdAt      DateTime     @default(now())
+
+  @@index([subscriptionId, createdAt])
+}
+
+model Discount {
+  id          Int           @id @default(autoincrement())
+  name        String
+  type        DiscountType
+  value       Int
+  scope       DiscountScope @default(SUBSCRIPTION)
+  minPurchase Int           @default(0)
+  minQuantity Int           @default(0)
+  startDate   DateTime?
+  endDate     DateTime?
+  usageLimit  Int?
+  usedCount   Int           @default(0)
+  active      Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+
+  products DiscountProduct[]
+}
+
+model DiscountProduct {
+  discountId Int
+  discount   Discount @relation(fields: [discountId], references: [id], onDelete: Cascade)
+  productId  Int
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([discountId, productId])
+}
+
+model Invoice {
+  id             Int           @id @default(autoincrement())
+  number         String        @unique
+  subscriptionId Int?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+  customerId     Int
+  customer       Customer      @relation(fields: [customerId], references: [id])
+  status         InvoiceStatus @default(DRAFT)
+  periodStart    DateTime
+  periodEnd      DateTime
+  issueDate      DateTime      @default(now())
+  dueDate        DateTime
+  subtotal       Int
+  discountTotal  Int           @default(0)
+  taxTotal       Int           @default(0)
+  total          Int
+  amountPaid     Int           @default(0)
+  taxSplit       String        @default("INTRA")
+  billingRunId   Int?
+  billingRun     BillingRun?   @relation(fields: [billingRunId], references: [id])
+  sentAt         DateTime?
+  confirmedAt    DateTime?
+  cancelledAt    DateTime?
+  createdAt      DateTime      @default(now())
+
+  lines    InvoiceLine[]
+  payments Payment[]
+
+  @@unique([subscriptionId, periodStart])
+  @@index([status, dueDate])
+  @@index([customerId])
+  @@index([issueDate])
+}
+
+model InvoiceLine {
+  id             Int     @id @default(autoincrement())
+  invoiceId      Int
+  invoice        Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  productId      Int?
+  description    String
+  explanation    String
+  quantity       Int
+  unitPrice      Int
+  discountAmount Int     @default(0)
+  taxRateBp      Int     @default(0)
+  taxAmount      Int     @default(0)
+  amount         Int
+
+  @@index([invoiceId])
+}
+
+model Payment {
+  id           Int           @id @default(autoincrement())
+  invoiceId    Int
+  invoice      Invoice       @relation(fields: [invoiceId], references: [id])
+  amount       Int
+  method       PaymentMethod
+  paidAt       DateTime
+  note         String?
+  reference    String?
+  recordedById Int?
+  createdAt    DateTime      @default(now())
+
+  @@index([invoiceId])
+  @@index([paidAt])
+}
+
+model BillingRun {
+  id           Int      @id @default(autoincrement())
+  runAt        DateTime @default(now())
+  dryRun       Boolean
+  triggeredBy  String
+  invoiceCount Int
+  totalAmount  Int
+  flaggedCount Int
+  summary      Json
+
+  invoices Invoice[]
+}
+
+model OutboxEmail {
+  id        Int      @id @default(autoincrement())
+  to        String
+  subject   String
+  body      String
+  kind      String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+model Counter {
+  key   String @id
+  value Int    @default(0)
+}
