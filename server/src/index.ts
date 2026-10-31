@@ -19,6 +19,7 @@ import reportRoutes from './routes/reports';
 import portalRoutes from './routes/portal';
 import searchRoutes from './routes/search';
 import reconcileRoutes from './routes/reconcile';
+import changeRoutes from './routes/changes';
 
 const app = express();
 
@@ -69,6 +70,7 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/portal', portalRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/reconcile', reconcileRoutes);
+app.use('/api/changes', changeRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
 
