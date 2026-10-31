@@ -2,6 +2,7 @@
 // list pages and reports stay under 2 seconds. Run after the demo seed:
 //   npm run db:seed:bulk
 import { PrismaClient, Prisma } from '@prisma/client';
+import { monthlyValue } from '../src/services/subscriptions';
 
 const prisma = new PrismaClient();
 const COUNT = Number(process.env.BULK_COUNT ?? 10000);
@@ -73,6 +74,29 @@ async function main() {
     });
     await prisma.subscriptionLine.createMany({ data: lines });
 
+    // MRR history so the movement report has something to show: activations,
+    // closures, pauses and some seat expansions and contractions.
+    const planOf = new Map(subs.map((s) => [s.number, plans.find((p) => p.id === s.planId)!]));
+    const numberOf = new Map((await prisma.subscription.findMany({ where: { id: { in: created.map((c) => c.id) } }, select: { id: true, number: true } })).map((s) => [s.id, s.number]));
+    const events: Prisma.SubscriptionEventCreateManyInput[] = [];
+    created.forEach((s, i) => {
+      if (!s.startDate || !['ACTIVE', 'PAUSED', 'CLOSED'].includes(s.status)) return;
+      const plan = planOf.get(numberOf.get(s.id)!)!;
+      const mrr = monthlyValue(plan, [lines[i]]);
+      const at = (daysAgo: number) => new Date(Math.max(s.startDate!.getTime(), today.getTime() - daysAgo * day));
+      events.push({ subscriptionId: s.id, type: 'STATUS', toStatus: 'ACTIVE', message: 'Subscription activated', actorName: 'System', mrrKind: 'NEW', mrrDelta: mrr, createdAt: s.startDate! });
+      if (s.status === 'CLOSED') {
+        events.push({ subscriptionId: s.id, type: 'STATUS', fromStatus: 'ACTIVE', toStatus: 'CLOSED', message: 'Subscription closed', actorName: 'System', mrrKind: 'CHURN', mrrDelta: -mrr, createdAt: at(rand(60)) });
+      } else if (s.status === 'PAUSED') {
+        events.push({ subscriptionId: s.id, type: 'STATUS', fromStatus: 'ACTIVE', toStatus: 'PAUSED', message: 'Subscription paused', actorName: 'System', mrrKind: 'PAUSE', mrrDelta: -mrr, createdAt: at(rand(60)) });
+      } else if (rand(10) === 0) {
+        events.push({ subscriptionId: s.id, type: 'CHANGE', message: 'Seats added', actorName: 'System', mrrKind: 'EXPANSION', mrrDelta: Math.round(mrr * 0.2), createdAt: at(rand(90)) });
+      } else if (rand(20) === 0) {
+        events.push({ subscriptionId: s.id, type: 'CHANGE', message: 'Seats removed', actorName: 'System', mrrKind: 'CONTRACTION', mrrDelta: -Math.round(mrr * 0.15), createdAt: at(rand(90)) });
+      }
+    });
+    await prisma.subscriptionEvent.createMany({ data: events });
+
     // One past invoice per billed subscription: some paid, some open, some overdue.
     const invoices: Prisma.InvoiceCreateManyInput[] = [];
     for (const s of created) {
@@ -95,6 +119,8 @@ async function main() {
         total,
         amountPaid: paid,
         confirmedAt: issue,
+        // Some paid invoices were only paid after overdue reminders (recovered).
+        reminderStage: paid >= total && rand(4) === 0 ? 3 + rand(2) : 0,
       });
     }
     await prisma.invoice.createMany({ data: invoices });

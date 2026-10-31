@@ -1,10 +1,20 @@
 import cron from 'node-cron';
-import { runBilling } from './services/billing';
+import { draftDueRenewals, runBilling } from './services/billing';
 import { sendPaymentReminders } from './services/reminders';
 import { isBillingRunning, setBillingRunning } from './routes/billing';
 
-// Nightly jobs: bill due subscriptions at 02:00, send payment reminders at 09:00.
+// Nightly jobs: draft renewals at 01:00, bill due subscriptions at 02:00,
+// send payment reminders and suspend long-overdue accounts at 09:00.
 export function startScheduler() {
+  cron.schedule('0 1 * * *', async () => {
+    try {
+      const r = await draftDueRenewals();
+      console.log(`[renewals] ${r.drafted} drafted`);
+    } catch (err) {
+      console.error('[renewals] failed', err);
+    }
+  });
+
   cron.schedule('0 2 * * *', async () => {
     if (isBillingRunning()) return;
     setBillingRunning(true);

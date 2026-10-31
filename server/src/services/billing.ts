@@ -1,4 +1,4 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, type Plan } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { addDays, addPeriod, startOfDay } from '../lib/dates';
 import { nextNumber } from '../lib/numbering';
@@ -6,7 +6,8 @@ import { formatINR } from '../lib/money';
 import { queueEmail } from '../lib/outbox';
 import { config } from '../config';
 import { loadPricingContext, priceSubscription, subscriptionPricingInclude, type PricedInvoice } from './pricing';
-import { logEvent } from './subscriptions';
+import { draftRenewal, logEvent, monthlyValue } from './subscriptions';
+import { applyOpenCredits, markCreditsUsed } from './credits';
 
 export interface BillingFlag {
   subscriptionId: number;
@@ -62,7 +63,7 @@ export async function runBilling(opts: { dryRun: boolean; triggeredBy: string; a
   for (;;) {
     const subs = await prisma.subscription.findMany({
       where: { status: 'ACTIVE', nextBillingDate: { lte: today }, id: { gt: cursor } },
-      include: subscriptionPricingInclude,
+      include: { ...subscriptionPricingInclude, pendingPlan: true },
       orderBy: { id: 'asc' },
       take: BATCH,
     });
@@ -71,7 +72,10 @@ export async function runBilling(opts: { dryRun: boolean; triggeredBy: string; a
 
     const lastTotals = await previousTotals(subs.map((s) => s.id));
 
-    for (const sub of subs) {
+    for (const original of subs) {
+      // A scheduled downgrade takes effect from this billing date.
+      const sub = original.pendingPlan ? { ...original, plan: original.pendingPlan } : original;
+      if (original.pendingPlan && !opts.dryRun) await switchToPendingPlan(original);
       // Discounts whose usage limit is used up during this run stop applying.
       const discounts = ctx.discounts.filter((d) => d.usageLimit == null || d.usedCount + (usage.get(d.id) ?? 0) < d.usageLimit);
       let periodStart = startOfDay(sub.nextBillingDate!);
@@ -87,7 +91,7 @@ export async function runBilling(opts: { dryRun: boolean; triggeredBy: string; a
           record(summary, sub, priced, periodStart, reasons);
         } else {
           const created = await createInvoice(sub, priced, periodStart, periodEnd, run!.id);
-          if (created) record(summary, sub, priced, periodStart, reasons);
+          if (created) record(summary, sub, { ...priced, total: created.total }, periodStart, reasons);
           else summary.skippedAlreadyBilled++;
         }
         for (const id of priced.appliedDiscountIds) usage.set(id, (usage.get(id) ?? 0) + 1);
@@ -103,7 +107,19 @@ export async function runBilling(opts: { dryRun: boolean; triggeredBy: string; a
               where: { id: sub.id },
               data: { status: 'CLOSED', closedAt: new Date(), closeReason: 'Expired (auto-close)', nextBillingDate: null },
             });
-            await logEvent(tx, sub.id, { type: 'STATUS', fromStatus: 'ACTIVE', toStatus: 'CLOSED', message: 'Closed automatically at expiry' }, null);
+            await logEvent(
+              tx,
+              sub.id,
+              {
+                type: 'STATUS',
+                fromStatus: 'ACTIVE',
+                toStatus: 'CLOSED',
+                message: 'Closed automatically at expiry',
+                mrrKind: 'CHURN',
+                mrrDelta: -monthlyValue(sub.plan, sub.lines),
+              },
+              null,
+            );
           } else {
             await tx.subscription.update({ where: { id: sub.id }, data: { nextBillingDate: expired ? null : periodStart } });
           }
@@ -186,9 +202,11 @@ async function previousTotals(subscriptionIds: number[]) {
 
 type SubForBilling = Prisma.SubscriptionGetPayload<{ include: typeof subscriptionPricingInclude }>;
 
-async function createInvoice(sub: SubForBilling, priced: PricedInvoice, periodStart: Date, periodEnd: Date, runId: number) {
+async function createInvoice(sub: SubForBilling, base: PricedInvoice, periodStart: Date, periodEnd: Date, runId: number) {
   try {
     return await prisma.$transaction(async (tx) => {
+      // Open credit notes reduce this invoice automatically.
+      const { priced, used } = await applyOpenCredits(tx, sub.customerId, base);
       const issueDate = new Date();
       const invoice = await tx.invoice.create({
         data: {
@@ -209,6 +227,7 @@ async function createInvoice(sub: SubForBilling, priced: PricedInvoice, periodSt
           lines: { create: priced.lines },
         },
       });
+      await markCreditsUsed(tx, invoice.id, used);
       await logEvent(
         tx,
         sub.id,
@@ -231,4 +250,50 @@ async function createInvoice(sub: SubForBilling, priced: PricedInvoice, periodSt
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') return null;
     throw err;
   }
+}
+
+// Applies a downgrade that was scheduled for the end of the previous period.
+async function switchToPendingPlan(sub: SubForBilling & { pendingPlan: Plan | null }) {
+  const next = sub.pendingPlan!;
+  await prisma.$transaction(async (tx) => {
+    await tx.subscription.update({ where: { id: sub.id }, data: { planId: next.id, pendingPlanId: null } });
+    const delta = monthlyValue(next, sub.lines) - monthlyValue(sub.plan, sub.lines);
+    await logEvent(
+      tx,
+      sub.id,
+      {
+        type: 'PLAN',
+        message: `Plan changed from ${sub.plan.name} to ${next.name} (scheduled downgrade)`,
+        mrrKind: delta >= 0 ? 'EXPANSION' : 'CONTRACTION',
+        mrrDelta: delta,
+      },
+      null,
+    );
+  });
+}
+
+// Renewal radar automation: active, renewable subscriptions expiring within 30 days
+// get a renewal draft so nobody has to remember to create it.
+export async function draftDueRenewals(asOf = new Date()) {
+  const today = startOfDay(asOf);
+  const due = await prisma.subscription.findMany({
+    where: {
+      status: { in: ['ACTIVE', 'PAUSED'] },
+      expiryDate: { gte: today, lte: addDays(today, 30) },
+      plan: { renewable: true },
+      renewal: { is: null },
+    },
+    include: { plan: true, lines: true },
+    take: 2000,
+  });
+  let drafted = 0;
+  for (const sub of due) {
+    try {
+      await prisma.$transaction((tx) => draftRenewal(tx, sub, null));
+      drafted++;
+    } catch {
+      // Already drafted concurrently or not renewable any more; skip.
+    }
+  }
+  return { drafted };
 }

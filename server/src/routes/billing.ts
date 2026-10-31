@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { asyncHandler, conflict } from '../lib/errors';
 import { requireAuth, staffOnly } from '../middleware/auth';
-import { runBilling } from '../services/billing';
+import { draftDueRenewals, runBilling } from '../services/billing';
 import { sendPaymentReminders } from '../services/reminders';
 import { config } from '../config';
 
@@ -36,6 +36,14 @@ router.post(
   '/reminders',
   asyncHandler(async (_req, res) => {
     res.json(await sendPaymentReminders());
+  }),
+);
+
+// Drafts renewals for subscriptions expiring within 30 days (also runs nightly).
+router.post(
+  '/renewals',
+  asyncHandler(async (_req, res) => {
+    res.json(await draftDueRenewals());
   }),
 );
 

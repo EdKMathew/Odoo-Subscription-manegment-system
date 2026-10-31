@@ -169,7 +169,7 @@ async function main() {
         periodStart: start,
         periodEnd: daysAgo(30 * h.monthsAgo - 29),
         issueDate: issued,
-        dueDate: daysAgo(30 * h.monthsAgo - 15),
+        dueDate: daysAgo(30 * h.monthsAgo - 20),
         subtotal: priced.subtotal,
         discountTotal: priced.discountTotal,
         taxTotal: priced.taxTotal,
