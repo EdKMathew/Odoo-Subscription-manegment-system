@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+build/
+
+# env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+db-password.txt
+
+# local notes
+PROGRESS.md
+
+# uploads and generated files
+server/uploads/
+server/storage/
+
+# logs and OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
