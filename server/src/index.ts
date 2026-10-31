@@ -11,6 +11,7 @@ import catalogRoutes from './routes/catalog';
 import customerRoutes from './routes/customers';
 import templateRoutes from './routes/templates';
 import subscriptionRoutes from './routes/subscriptions';
+import discountRoutes from './routes/discounts';
 import invoiceRoutes from './routes/invoices';
 import billingRoutes from './routes/billing';
 
@@ -56,6 +57,7 @@ app.use('/api/catalog', catalogRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
+app.use('/api/discounts', discountRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/billing', billingRoutes);
 

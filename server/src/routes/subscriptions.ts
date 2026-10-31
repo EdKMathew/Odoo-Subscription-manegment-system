@@ -65,7 +65,7 @@ router.post(
     await prisma.$transaction(async (tx) => {
       const updated = await tx.subscription.updateMany({
         where: { id: sub.id, status: 'QUOTATION' },
-        data: { status: 'CONFIRMED', acceptedAt: new Date(), acceptTokenHash: null },
+        data: { status: 'CONFIRMED', acceptedAt: new Date() },
       });
       if (updated.count !== 1) throw conflict('This quotation has already been handled');
       await logEvent(
@@ -91,8 +91,9 @@ router.get(
     const q = optionalString(req.query.q);
     const ownCustomer = customerScope(req);
     const where: Prisma.SubscriptionWhereInput = {
-      ...(ownCustomer ? { customerId: ownCustomer } : {}),
-      ...(status ? { status } : {}),
+      // Drafts are internal; customers only see subscriptions once quoted.
+      ...(ownCustomer ? { customerId: ownCustomer, status: { not: 'DRAFT' as const } } : {}),
+      ...(status && !(ownCustomer && status === 'DRAFT') ? { status } : {}),
       ...(q
         ? {
             OR: [
@@ -129,7 +130,7 @@ async function loadOwned(req: Parameters<typeof customerScope>[0], id: number) {
   const ownCustomer = customerScope(req);
   const sub = await prisma.subscription.findUnique({ where: { id }, include: subscriptionPricingInclude });
   // Customers get a 404 (not 403) for other people's subscriptions so ids can't be probed.
-  if (!sub || (ownCustomer && sub.customerId !== ownCustomer)) throw notFound('Subscription not found');
+  if (!sub || (ownCustomer && (sub.customerId !== ownCustomer || sub.status === 'DRAFT'))) throw notFound('Subscription not found');
   return sub;
 }
 
@@ -274,6 +275,49 @@ router.put(
   }),
 );
 
+// Drafts a renewal: a new subscription with the same plan and lines, starting
+// when the current one expires, ready to be sent as a quotation.
+router.post(
+  '/:id/renew',
+  staffOnly,
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    const sub = await prisma.subscription.findUnique({ where: { id }, include: { plan: true, lines: true } });
+    if (!sub) throw notFound('Subscription not found');
+    if (!sub.plan.renewable) throw conflict('This plan is not renewable');
+    if (!sub.expiryDate) throw conflict('This subscription has no expiry date to renew from');
+    if (sub.status !== 'ACTIVE' && sub.status !== 'PAUSED') throw conflict('Only active or paused subscriptions can be renewed');
+    const length = sub.startDate ? sub.expiryDate.getTime() - sub.startDate.getTime() : null;
+    const renewal = await prisma.$transaction(async (tx) => {
+      const created = await tx.subscription.create({
+        data: {
+          number: await nextNumber(tx, 'SUB'),
+          customerId: sub.customerId,
+          planId: sub.planId,
+          startDate: sub.expiryDate,
+          expiryDate: length ? new Date(sub.expiryDate!.getTime() + length) : null,
+          paymentTermDays: sub.paymentTermDays,
+          notes: `Renewal of ${sub.number}`,
+          createdById: req.user!.id,
+          lines: {
+            create: sub.lines.map((l) => ({
+              productId: l.productId,
+              variantId: l.variantId,
+              description: l.description,
+              quantity: l.quantity,
+              unitPrice: l.unitPrice,
+            })),
+          },
+        },
+      });
+      await logEvent(tx, created.id, { type: 'CREATED', toStatus: 'DRAFT', message: `Drafted as renewal of ${sub.number}` }, req.user!);
+      await logEvent(tx, sub.id, { type: 'RENEWAL', message: `Renewal drafted as ${created.number}` }, req.user!);
+      return created;
+    });
+    res.status(201).json(renewal);
+  }),
+);
+
 const transitionSchema = z.object({
   to: z.enum(statuses),
   reason: z.string().trim().max(500).optional(),
@@ -315,7 +359,6 @@ router.post(
     }
     if (to === 'CONFIRMED') {
       data.acceptedAt = new Date();
-      data.acceptTokenHash = null;
       message = actor.role === 'CUSTOMER' ? 'Quotation accepted by customer' : 'Quotation confirmed';
     }
     if (to === 'ACTIVE' && sub.status === 'CONFIRMED') {
