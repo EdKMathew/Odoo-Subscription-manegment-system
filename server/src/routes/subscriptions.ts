@@ -12,8 +12,9 @@ import { createToken, hashToken } from '../lib/password';
 import { queueEmail } from '../lib/outbox';
 import { formatINR } from '../lib/money';
 import { config } from '../config';
-import { assertTransition, logEvent } from '../services/subscriptions';
+import { assertTransition, draftRenewal, logEvent, monthlyValue, type MrrKind } from '../services/subscriptions';
 import { loadPricingContext, priceSubscription, subscriptionPricingInclude } from '../services/pricing';
+import { applyOpenCredits } from '../services/credits';
 
 const router = Router();
 
@@ -138,7 +139,7 @@ router.get(
   '/:id',
   asyncHandler(async (req, res) => {
     const sub = await loadOwned(req, idParam(req));
-    const [events, invoices] = await Promise.all([
+    const [events, invoices, extra] = await Promise.all([
       prisma.subscriptionEvent.findMany({ where: { subscriptionId: sub.id }, orderBy: { createdAt: 'desc' }, take: 100 }),
       prisma.invoice.findMany({
         where: { subscriptionId: sub.id },
@@ -146,10 +147,22 @@ router.get(
         take: 50,
         select: { id: true, number: true, status: true, total: true, amountPaid: true, dueDate: true, periodStart: true, periodEnd: true },
       }),
+      prisma.subscription.findUniqueOrThrow({
+        where: { id: sub.id },
+        select: {
+          pendingPlan: { select: { id: true, name: true, price: true, billingPeriod: true } },
+          renewal: { select: { id: true, number: true, status: true } },
+          renewalOf: { select: { id: true, number: true } },
+          creditNotes: { select: { id: true, number: true, reason: true, total: true, remaining: true, status: true, createdAt: true }, orderBy: { createdAt: 'desc' } },
+        },
+      }),
     ]);
     const ctx = await loadPricingContext(prisma, sub.nextBillingDate ?? new Date());
-    const nextBill = sub.status === 'CLOSED' ? null : priceSubscription(sub, ctx);
-    res.json({ ...sub, acceptTokenHash: undefined, events, invoices, nextBill });
+    // The next bill reflects a scheduled plan change and any open credit.
+    const nextPlan = extra.pendingPlan ? await prisma.plan.findUniqueOrThrow({ where: { id: extra.pendingPlan.id } }) : sub.plan;
+    const nextBill =
+      sub.status === 'CLOSED' ? null : (await applyOpenCredits(prisma, sub.customerId, priceSubscription({ ...sub, plan: nextPlan }, ctx))).priced;
+    res.json({ ...sub, ...extra, acceptTokenHash: undefined, events, invoices, nextBill });
   }),
 );
 
@@ -284,36 +297,7 @@ router.post(
     const id = idParam(req);
     const sub = await prisma.subscription.findUnique({ where: { id }, include: { plan: true, lines: true } });
     if (!sub) throw notFound('Subscription not found');
-    if (!sub.plan.renewable) throw conflict('This plan is not renewable');
-    if (!sub.expiryDate) throw conflict('This subscription has no expiry date to renew from');
-    if (sub.status !== 'ACTIVE' && sub.status !== 'PAUSED') throw conflict('Only active or paused subscriptions can be renewed');
-    const length = sub.startDate ? sub.expiryDate.getTime() - sub.startDate.getTime() : null;
-    const renewal = await prisma.$transaction(async (tx) => {
-      const created = await tx.subscription.create({
-        data: {
-          number: await nextNumber(tx, 'SUB'),
-          customerId: sub.customerId,
-          planId: sub.planId,
-          startDate: sub.expiryDate,
-          expiryDate: length ? new Date(sub.expiryDate!.getTime() + length) : null,
-          paymentTermDays: sub.paymentTermDays,
-          notes: `Renewal of ${sub.number}`,
-          createdById: req.user!.id,
-          lines: {
-            create: sub.lines.map((l) => ({
-              productId: l.productId,
-              variantId: l.variantId,
-              description: l.description,
-              quantity: l.quantity,
-              unitPrice: l.unitPrice,
-            })),
-          },
-        },
-      });
-      await logEvent(tx, created.id, { type: 'CREATED', toStatus: 'DRAFT', message: `Drafted as renewal of ${sub.number}` }, req.user!);
-      await logEvent(tx, sub.id, { type: 'RENEWAL', message: `Renewal drafted as ${created.number}` }, req.user!);
-      return created;
-    });
+    const renewal = await prisma.$transaction((tx) => draftRenewal(tx, sub, req.user!));
     res.status(201).json(renewal);
   }),
 );
@@ -338,6 +322,10 @@ router.post(
       if (!allowed.includes(to) || (to === 'ACTIVE' && sub.status !== 'PAUSED')) {
         throw conflict('This action is not available from the portal');
       }
+      // A subscription suspended for non-payment comes back when the overdue invoice is paid.
+      if (to === 'ACTIVE' && sub.suspendedAt) {
+        throw conflict('This subscription is suspended for an unpaid invoice. It resumes automatically once the invoice is paid.');
+      }
     }
     assertTransition(sub.status, to, sub.plan, actor);
     if (to === 'CONFIRMED' && sub.quoteExpiresAt && sub.quoteExpiresAt < new Date()) {
@@ -348,6 +336,13 @@ router.post(
     const data: Prisma.SubscriptionUpdateInput = { status: to };
     let message = `Status changed from ${sub.status} to ${to}`;
     let acceptLink: string | null = null;
+    // How this change moves monthly recurring revenue.
+    const mrr = monthlyValue(sub.plan, sub.lines);
+    let movement: { mrrKind: MrrKind; mrrDelta: number } | undefined;
+    if (to === 'ACTIVE' && sub.status === 'CONFIRMED') movement = { mrrKind: 'NEW', mrrDelta: mrr };
+    if (to === 'ACTIVE' && sub.status === 'PAUSED') movement = { mrrKind: 'REACTIVATION', mrrDelta: mrr };
+    if (to === 'PAUSED') movement = { mrrKind: 'PAUSE', mrrDelta: -mrr };
+    if (to === 'CLOSED' && sub.status === 'ACTIVE') movement = { mrrKind: 'CHURN', mrrDelta: -mrr };
 
     if (to === 'QUOTATION') {
       const tpl = await prisma.quoteTemplate.findFirst({ where: { planId: sub.planId }, orderBy: { id: 'asc' } });
@@ -370,6 +365,7 @@ router.post(
     if (to === 'ACTIVE' && sub.status === 'PAUSED') {
       // Resume: billing continues from today; discounts kept while paused still apply.
       data.pausedAt = null;
+      data.suspendedAt = null;
       if (!sub.nextBillingDate || sub.nextBillingDate < today) data.nextBillingDate = today;
       message = 'Subscription resumed';
     }
@@ -381,14 +377,16 @@ router.post(
       data.closedAt = new Date();
       data.closeReason = reason ?? null;
       data.nextBillingDate = null;
+      data.pendingPlan = { disconnect: true };
       message = reason ? `Subscription closed: ${reason}` : 'Subscription closed';
     }
 
     await prisma.$transaction(async (tx) => {
       // Guard against two people changing the status at the same time.
-      const updated = await tx.subscription.updateMany({ where: { id, status: sub.status }, data: data as Prisma.SubscriptionUpdateManyMutationInput });
+      const { pendingPlan, ...scalar } = data;
+      const updated = await tx.subscription.updateMany({ where: { id, status: sub.status }, data: { ...(scalar as Prisma.SubscriptionUpdateManyMutationInput), ...(pendingPlan ? { pendingPlanId: null } : {}) } });
       if (updated.count !== 1) throw conflict('This subscription was changed by someone else, please refresh');
-      await logEvent(tx, id, { type: 'STATUS', fromStatus: sub.status, toStatus: to, message }, actor);
+      await logEvent(tx, id, { type: 'STATUS', fromStatus: sub.status, toStatus: to, message, ...movement }, actor);
       if (acceptLink) {
         const ctx = await loadPricingContext(tx, new Date());
         const priced = priceSubscription(sub, ctx);

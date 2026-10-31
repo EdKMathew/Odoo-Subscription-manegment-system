@@ -1,20 +1,21 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { asyncHandler, badRequest, conflict, notFound } from '../lib/errors';
-import { requireAuth, staffOnly } from '../middleware/auth';
+import { customerScope, requireAuth, staffOnly } from '../middleware/auth';
 import { idParam } from '../lib/paging';
 import { addDays, addPeriod, DAY_MS, startOfDay } from '../lib/dates';
 import { nextNumber } from '../lib/numbering';
 import { formatINR } from '../lib/money';
 import { priceSubscription, subscriptionPricingInclude, type PricedLine, type SubscriptionForPricing } from '../services/pricing';
-import { logEvent } from '../services/subscriptions';
+import { logEvent, monthlyValue } from '../services/subscriptions';
+import { applyPlanChange, previewPlanChange } from '../services/planChange';
 
 // Mid-cycle quantity changes on an active subscription.
 // Increases are charged now for the days left in the current period (prorated);
 // decreases take effect from the next billing date, with no refund for the current period.
 const router = Router();
-router.use(requireAuth, staffOnly);
+router.use(requireAuth);
 
 const changeSchema = z.object({
   lines: z
@@ -92,6 +93,7 @@ async function buildChange(id: number, input: z.infer<typeof changeSchema>) {
 
 router.post(
   '/:id/preview',
+  staffOnly,
   asyncHandler(async (req, res) => {
     const { preview } = await buildChange(idParam(req), changeSchema.parse(req.body));
     res.json(preview);
@@ -100,6 +102,7 @@ router.post(
 
 router.post(
   '/:id/apply',
+  staffOnly,
   asyncHandler(async (req, res) => {
     const id = idParam(req);
     const { sub, newQty, preview } = await buildChange(id, changeSchema.parse(req.body));
@@ -133,18 +136,52 @@ router.post(
           },
         });
       }
+      const mrrDelta =
+        monthlyValue(sub.plan, sub.lines.map((l) => ({ ...l, quantity: newQty.get(l.id) ?? l.quantity }))) - monthlyValue(sub.plan, sub.lines);
       await logEvent(
         tx,
         id,
         {
           type: 'CHANGE',
           message: `Quantities changed: ${changes}${created ? `. Prorated invoice ${created.number} for ${formatINR(created.total)}` : ''}${preview.decreases.length ? '. Reductions apply from the next billing date' : ''}`,
+          mrrKind: mrrDelta >= 0 ? 'EXPANSION' : 'CONTRACTION',
+          mrrDelta,
         },
         req.user!,
       );
       return created;
     });
     res.json({ ok: true, invoiceId: invoice?.id ?? null });
+  }),
+);
+
+// ---------- Plan changes (staff, or the customer for downgrades) ----------
+
+const planSchema = z.object({ planId: z.number().int().positive() });
+
+async function ownedSubscription(req: Request, id: number) {
+  const own = customerScope(req);
+  if (own) {
+    const sub = await prisma.subscription.findUnique({ where: { id }, select: { customerId: true, status: true } });
+    if (!sub || sub.customerId !== own || sub.status === 'DRAFT') throw notFound('Subscription not found');
+  }
+}
+
+router.post(
+  '/:id/plan-preview',
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    await ownedSubscription(req, id);
+    res.json(await previewPlanChange(id, planSchema.parse(req.body).planId));
+  }),
+);
+
+router.post(
+  '/:id/plan-apply',
+  asyncHandler(async (req, res) => {
+    const id = idParam(req);
+    await ownedSubscription(req, id);
+    res.json(await applyPlanChange(id, planSchema.parse(req.body).planId, req.user!));
   }),
 );
 
