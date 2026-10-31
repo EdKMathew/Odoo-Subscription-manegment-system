@@ -22,3 +22,9 @@ body {
 .tabular {
   font-variant-numeric: tabular-nums;
 }
+
+/* Let grid and flex children shrink so wide tables scroll inside their card instead of the page. */
+.grid > *,
+main {
+  min-width: 0;
+}
