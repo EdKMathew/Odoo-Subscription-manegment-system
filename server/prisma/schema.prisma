@@ -325,6 +325,7 @@ model Invoice {
   billingRunId   Int?
   billingRun     BillingRun?   @relation(fields: [billingRunId], references: [id])
   sentAt         DateTime?
+  reminderStage  Int           @default(0)
   confirmedAt    DateTime?
   cancelledAt    DateTime?
   createdAt      DateTime      @default(now())

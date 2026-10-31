@@ -20,11 +20,16 @@ export function addPeriod(d: Date, period: BillingPeriod, count = 1): Date {
       x.setDate(x.getDate() + 7 * count);
       break;
     case 'MONTHLY':
-      x.setMonth(x.getMonth() + count);
+    case 'YEARLY': {
+      // Clamp to the last day of the month so 31 Jan + 1 month is 28/29 Feb, not 3 Mar.
+      const months = period === 'MONTHLY' ? count : 12 * count;
+      const day = x.getDate();
+      x.setDate(1);
+      x.setMonth(x.getMonth() + months);
+      const lastDay = new Date(x.getFullYear(), x.getMonth() + 1, 0).getDate();
+      x.setDate(Math.min(day, lastDay));
       break;
-    case 'YEARLY':
-      x.setFullYear(x.getFullYear() + count);
-      break;
+    }
   }
   return x;
 }

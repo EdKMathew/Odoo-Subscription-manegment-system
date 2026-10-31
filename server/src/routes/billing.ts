@@ -4,6 +4,7 @@ import { prisma } from '../lib/prisma';
 import { asyncHandler, conflict } from '../lib/errors';
 import { requireAuth, staffOnly } from '../middleware/auth';
 import { runBilling } from '../services/billing';
+import { sendPaymentReminders } from '../services/reminders';
 import { config } from '../config';
 
 const router = Router();
@@ -27,6 +28,14 @@ router.post(
     } finally {
       running = false;
     }
+  }),
+);
+
+// Runs the payment reminder ladder now instead of waiting for the 09:00 job.
+router.post(
+  '/reminders',
+  asyncHandler(async (_req, res) => {
+    res.json(await sendPaymentReminders());
   }),
 );
 

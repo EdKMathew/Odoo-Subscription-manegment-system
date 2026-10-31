@@ -5,6 +5,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { config } from './config';
 import { errorHandler, HttpError } from './lib/errors';
+import { startScheduler } from './scheduler';
 import authRoutes from './routes/auth';
 import userRoutes from './routes/users';
 import catalogRoutes from './routes/catalog';
@@ -74,4 +75,5 @@ app.use(errorHandler);
 
 app.listen(config.port, () => {
   console.log(`API listening on http://localhost:${config.port}`);
+  startScheduler();
 });
