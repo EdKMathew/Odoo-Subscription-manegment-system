@@ -6,6 +6,7 @@ import { config } from './config';
 import { errorHandler, HttpError } from './lib/errors';
 import authRoutes from './routes/auth';
 import userRoutes from './routes/users';
+import catalogRoutes from './routes/catalog';
 
 const app = express();
 
@@ -43,6 +44,7 @@ app.use((_req, res, next) => {
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/catalog', catalogRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
 app.use(errorHandler);
