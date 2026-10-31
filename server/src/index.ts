@@ -15,6 +15,9 @@ import subscriptionRoutes from './routes/subscriptions';
 import discountRoutes from './routes/discounts';
 import invoiceRoutes from './routes/invoices';
 import billingRoutes from './routes/billing';
+import reportRoutes from './routes/reports';
+import portalRoutes from './routes/portal';
+import searchRoutes from './routes/search';
 
 const app = express();
 
@@ -61,6 +64,9 @@ app.use('/api/subscriptions', subscriptionRoutes);
 app.use('/api/discounts', discountRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/billing', billingRoutes);
+app.use('/api/reports', reportRoutes);
+app.use('/api/portal', portalRoutes);
+app.use('/api/search', searchRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
 
