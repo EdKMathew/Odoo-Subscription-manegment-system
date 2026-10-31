@@ -10,6 +10,7 @@ import catalogRoutes from './routes/catalog';
 import customerRoutes from './routes/customers';
 import templateRoutes from './routes/templates';
 import subscriptionRoutes from './routes/subscriptions';
+import billingRoutes from './routes/billing';
 
 const app = express();
 
@@ -17,7 +18,9 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors({ origin: config.clientUrl, credentials: true, exposedHeaders: ['X-Response-Time'] }));
-app.use(express.json({ limit: '200kb' }));
+// Bank statement uploads get a larger body limit on their own route.
+const jsonBody = express.json({ limit: '200kb' });
+app.use((req, res, next) => (req.path.startsWith('/api/reconcile') ? next() : jsonBody(req, res, next)));
 app.use(cookieParser());
 
 // CSRF defence: state-changing requests must be JSON or multipart, which a
@@ -51,6 +54,7 @@ app.use('/api/catalog', catalogRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
+app.use('/api/billing', billingRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
 app.use(errorHandler);
