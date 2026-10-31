@@ -109,7 +109,7 @@ In production the API also serves the built frontend from the same origin on por
 
 ## Team
 
-- Anirudh
 - Edwin
 - Advaith
+- Anirudh
 - Rahul
