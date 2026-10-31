@@ -18,6 +18,7 @@ import billingRoutes from './routes/billing';
 import reportRoutes from './routes/reports';
 import portalRoutes from './routes/portal';
 import searchRoutes from './routes/search';
+import reconcileRoutes from './routes/reconcile';
 
 const app = express();
 
@@ -67,6 +68,7 @@ app.use('/api/billing', billingRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/portal', portalRoutes);
 app.use('/api/search', searchRoutes);
+app.use('/api/reconcile', reconcileRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
 
