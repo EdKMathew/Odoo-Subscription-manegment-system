@@ -1,3 +1,4 @@
+import path from 'path';
 import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
@@ -10,6 +11,7 @@ import catalogRoutes from './routes/catalog';
 import customerRoutes from './routes/customers';
 import templateRoutes from './routes/templates';
 import subscriptionRoutes from './routes/subscriptions';
+import invoiceRoutes from './routes/invoices';
 import billingRoutes from './routes/billing';
 
 const app = express();
@@ -54,9 +56,18 @@ app.use('/api/catalog', catalogRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
+app.use('/api/invoices', invoiceRoutes);
 app.use('/api/billing', billingRoutes);
 
 app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Not found')));
+
+// In production the built frontend is served from the same origin.
+if (config.isProd) {
+  const dist = path.resolve(__dirname, '../../client/dist');
+  app.use(express.static(dist, { index: false, maxAge: '1h' }));
+  app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
+}
+
 app.use(errorHandler);
 
 app.listen(config.port, () => {
