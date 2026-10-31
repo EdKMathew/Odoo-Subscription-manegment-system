@@ -57,9 +57,13 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
     }
     const user = await prisma.user.findUnique({
       where: { id: Number(payload.sub) },
-      select: { id: true, email: true, name: true, role: true, customerId: true, active: true },
+      select: { id: true, email: true, name: true, role: true, customerId: true, active: true, passwordChangedAt: true },
     });
     if (!user || !user.active) throw new HttpError(401, 'Please log in');
+    // Sessions issued before the last password change are no longer valid.
+    if ((payload.iat ?? 0) * 1000 < user.passwordChangedAt.getTime() - 1000) {
+      throw new HttpError(401, 'Your password was changed, please log in again');
+    }
     req.user = { id: user.id, email: user.email, name: user.name, role: user.role, customerId: user.customerId };
     next();
   } catch (err) {

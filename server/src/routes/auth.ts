@@ -18,7 +18,10 @@ const authLimiter = rateLimit({
   message: { error: 'Too many attempts, please try again in a few minutes' },
 });
 
-const emailSchema = z.string().trim().toLowerCase().email('Enter a valid email').max(254);
+// bcrypt hash of a random string, compared against when the email is unknown.
+const DUMMY_HASH = '$2a$12$rmYI/JYlVh6GXYgWm8cMUuQOeI.yacevjTmyC3wT1lR5SPBLiR.X6';
+
+const emailSchema =z.string().trim().toLowerCase().email('Enter a valid email').max(254);
 
 const signupSchema = z.object({
   name: z.string().trim().min(2, 'Name is too short').max(100),
@@ -73,8 +76,8 @@ router.post(
   asyncHandler(async (req, res) => {
     const { email, password } = loginSchema.parse(req.body);
     const user = await prisma.user.findUnique({ where: { email } });
-    // Same message for unknown email and wrong password so accounts can't be enumerated.
-    const ok = user && user.active && (await verifyPassword(password, user.passwordHash));
+    // Same message and similar timing for unknown email and wrong password so accounts can't be enumerated.
+    const ok = (await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH)) && user && user.active;
     if (!ok) throw new HttpError(401, 'Invalid email or password');
     issueSession(res, user.id);
     res.json({ user: publicUser(user) });
@@ -141,7 +144,7 @@ router.post(
         data: { usedAt: new Date() },
       });
       if (claimed.count !== 1) throw badRequest('This reset link is invalid or has expired');
-      await tx.user.update({ where: { id: reset.userId }, data: { passwordHash } });
+      await tx.user.update({ where: { id: reset.userId }, data: { passwordHash, passwordChangedAt: new Date() } });
     });
     res.json({ ok: true });
   }),

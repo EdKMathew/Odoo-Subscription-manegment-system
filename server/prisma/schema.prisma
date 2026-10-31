@@ -67,6 +67,7 @@ model User {
   email        String    @unique
   name         String
   passwordHash String
+  passwordChangedAt DateTime @default(now())
   role         Role      @default(CUSTOMER)
   active       Boolean   @default(true)
   customerId   Int?      @unique
